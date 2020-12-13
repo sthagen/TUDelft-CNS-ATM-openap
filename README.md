@@ -3,7 +3,7 @@ Open Aircraft Performance Model (OpenAP) Toolkit
 
 This repository contains all OpenAP databases and a Python implementation which facilitates the data access and aircraft performance computation.
 
-OpenAP is originated from the PhD project of Junzi Sun from [TU Delft](https://www.tudelft.nl/en/), Aerospace Engineering Faculty, [CNS/ATM research group](http://cs.lr.tudelft.nl/atm/). The PhD project - *Open Aircraft Performance Modeling: Based on an Analysis of Aircraft Surveillance Data* - started in 2015 and completed in 2019. 
+OpenAP is originated from the PhD project of Junzi Sun from [TU Delft](https://www.tudelft.nl/en/), Aerospace Engineering Faculty, [CNS/ATM research group](http://cs.lr.tudelft.nl/atm/). The PhD project - *Open Aircraft Performance Modeling: Based on an Analysis of Aircraft Surveillance Data* - started in 2015 and completed in 2019.
 
 
 Read the PhD thesis [here](https://doi.org/10.4233/uuid:af94d535-1853-4a6c-8b3f-77c98a52346a). Read the preprint of OpenAP toolkits [here](https://www.researchgate.net/publication/332013573_OpenAP_The_open-source_aircraft_performance_model_and_associated_toolkit).
@@ -87,7 +87,7 @@ from openap import FuelFlow
 
 ff = FuelFlow(ac='A320', eng='CFM56-5B4')
 
-FF = ff.at_thrust(thr=50000, alt=30000)
+FF = ff.at_thrust(acthr=50000, alt=30000)
 FF = ff.takeoff(tas=100, alt=0, throttle=1)
 FF = ff.enroute(mass=60000, tas=200, alt=20000, path_angle=3)
 FF = ff.enroute(mass=60000, tas=230, alt=32000, path_angle=0)
@@ -142,7 +142,7 @@ trajgen = Generator(ac='a320')
 
 trajgen.enable_noise()   # enable Gaussian noise in trajectory data
 
-data_cl = trajgen.climb(dt=10, random=True)  # using radom paramerters
+data_cl = trajgen.climb(dt=10, random=True)  # using random paramerters
 data_cl = trajgen.climb(dt=10, cas_const_cl=280, mach_const_cl=0.78, alt_cr=35000)
 
 data_de = trajgen.descent(dt=10, random=True)
@@ -153,6 +153,5 @@ data_cr = trajgen.cruise(dt=60, range_cr=2000, alt_cr=35000, m_cr=0.78)
 
 data_all = trajgen.complete(dt=10, random=True)
 data_all = trajgen.complete(dt=10, alt_cr=35000, m_cr=0.78,
-                            cas_const_cl=280, mach_const_cl=0.78,
-                            cas_const_de=280, mach_const_de=0.78)
+                            cas_const_cl=260, cas_const_de=260)
 ```
