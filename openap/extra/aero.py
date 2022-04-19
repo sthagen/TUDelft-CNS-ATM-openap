@@ -1,4 +1,4 @@
-"""Aero library inspried by @ProfHoekstra/bluesky.
+"""Aero library inspired by @ProfHoekstra/bluesky.
 
 Functions for aeronautics in this module
     - physical quantities always in SI units
@@ -9,15 +9,15 @@ International Standard Atmosphere
     a = vsound(h)         # speed of sound [m/s] as function of h[m]
     p = pressure(h)       # calls atmos but retruns only pressure [Pa]
     T = temperature(h)    # calculates temperature [K]
-    rho = density(h)      # calls atmos but retruns only density [kg/m3]
+    rho = density(h)      # calls atmos but returns only density [kg/m3]
 
 Speed conversion at altitude h[m] in ISA:
     mach = tas2mach(v_tas,h)    # true airspeed (v_tas) to mach number conversion
     v_tas = mach2tas(mach,h)    # true airspeed (v_tas) to mach number conversion
-    v_tas = eas2tas(v_eas,h)     # equivalent airspeed to true airspeed, h in [m]
-    v_eas = tas2eas(v_tas,h)     # true airspeed to equivent airspeed, h in [m]
-    v_tas = cas2tas(v_cas,h)     # v_cas  to v_tas conversion both m/s, h in [m]
-    v_cas = tas2cas(v_tas,h)     # v_tas to v_cas conversion both m/s, h in [m]
+    v_tas = eas2tas(v_eas,h)    # equivalent airspeed to true airspeed, h in [m]
+    v_eas = tas2eas(v_tas,h)    # true airspeed to equivent airspeed, h in [m]
+    v_tas = cas2tas(v_cas,h)    # v_cas  to v_tas conversion both m/s, h in [m]
+    v_cas = tas2cas(v_tas,h)    # v_tas to v_cas conversion both m/s, h in [m]
     v_cas = mach2cas(mach,h)    # mach to v_cas conversion v_cas in m/s, h in [m]
     mach   = cas2mach(v_cas,h)  # v_cas to mach copnversion v_cas in m/s, h in [m]
 """
@@ -175,6 +175,64 @@ def bearing(lat1, lon1, lat2, lon2):
     return bearing
 
 
+def h_isa(p):
+    """Compute ISA altitude for a given pressure.
+
+    Args:
+        p (float or ndarray): Pressure (in Pa).
+
+    Returns:
+        float or ndarray: altitude (m).
+
+    """
+    # p >= 22630:
+    T = T0 * (p0 / p) ** ((-0.0065 * R) / g0)
+    h = (T - T0) / -0.0065
+
+    # 5470 < p < 22630
+    T1 = T0 - 0.0065 * (11000)
+    p1 = 22630
+    h1 = -R * T1 / g0 * np.log(p / p1) + 11000
+
+    h_ = np.where(p > 22630, h, h1)
+
+    return h_
+
+
+def latlon(lat1, lon1, d, brg, h=0):
+    """Get lat/lon given current point, distance and bearing.
+
+    Args:
+        lat1 (float or ndarray): Starting latitude (in degrees).
+        lon1 (float or ndarray): Starting longitude (in degrees).
+        d (float or ndarray): distance from point 1 (meters)
+        brg (float or ndarray): bearing at point 1 (in degrees)
+        h (float or ndarray): Altitude (in meters). Defaults to 0.
+
+    Returns:
+        lat2: Point latitude.
+        lon2: Point longitude
+
+    """
+    # convert decimal degrees to radians
+    lat1 = np.radians(lat1)
+    lon1 = np.radians(lon1)
+    brg = np.radians(brg)
+
+    # haversine formula
+    lat2 = np.arcsin(
+        np.sin(lat1) * np.cos(d / (r_earth + h))
+        + np.cos(lat1) * np.sin(d / (r_earth + h)) * np.cos(brg)
+    )
+    lon2 = lon1 + np.arctan2(
+        np.sin(brg) * np.sin(d / (r_earth + h)) * np.cos(lat1),
+        np.cos(d / (r_earth + h)) - np.sin(lat1) * np.sin(lat2),
+    )
+    lat2 = np.degrees(lat2)
+    lon2 = np.degrees(lon2)
+    return lat2, lon2
+
+
 def tas2mach(v_tas, h):
     """Convert true airspeed to mach number at a given altitude.
 
@@ -306,7 +364,7 @@ def cas2mach(v_cas, h):
 
 
 def crossover_alt(v_cas, mach):
-    """Conver the crossover altitude given constant CAS and Mach.
+    """Convert the crossover altitude given constant CAS and Mach.
 
     Args:
         v_cas (float or ndarray): Calibrated airspeed (m/s).

@@ -1,39 +1,49 @@
 """OpenAP drag model."""
 
 import os
+import importlib
+import pandas as pd
 import glob
 import yaml
+import math
 import warnings
-import numpy as np
-from openap import prop
-from openap.extra import aero
-from openap.extra import ndarrayconvert
+from . import prop
+from .extra import ndarrayconvert
+
 
 curr_path = os.path.dirname(os.path.realpath(__file__))
 dir_dragpolar = curr_path + "/data/dragpolar/"
+file_synonym = curr_path + "/data/dragpolar/_synonym.csv"
+
+polar_synonym = pd.read_csv(file_synonym)
 
 
 class Drag(object):
-    """Compute the drag of aicraft."""
+    """Compute the drag of aircraft."""
 
-    def __init__(self, ac, wave_drag=False):
+    def __init__(self, ac, wave_drag=False, **kwargs):
         """Initialize Drag object.
 
         Args:
             ac (string): ICAO aircraft type (for example: A320).
+            wave_drag (bool): enable wave_drag model (experimental).
 
         """
-        super(Drag, self).__init__()
+        if not hasattr(self, "np"):
+            self.np = importlib.import_module("numpy")
+
+        if not hasattr(self, "aero"):
+            self.aero = importlib.import_module("openap").aero
+
+        self.use_synonym = kwargs.get("use_synonym", False)
 
         self.ac = ac.lower()
-        self.aircraft = prop.aircraft(ac)
+        self.aircraft = prop.aircraft(ac, **kwargs)
         self.polar = self.dragpolar()
-        self.wave_drag = wave_drag
 
+        self.wave_drag = wave_drag
         if self.wave_drag:
-            warnings.warn(
-                "Performance warning: Wave drag model is inaccurate at the moment. This will be fixed in future release."
-            )
+            warnings.warn("Performance warning: Wave drag model is experimental.")
 
     def dragpolar(self):
         """Find and construct the drag polar model.
@@ -43,54 +53,51 @@ class Drag(object):
 
         """
         polar_files = glob.glob(dir_dragpolar + "*.yml")
-        ac_polar_avaiable = [s[-8:-4].lower() for s in polar_files]
+        ac_polar_available = [s[-8:-4].lower() for s in polar_files]
 
-        if self.ac in ac_polar_avaiable:
+        if self.ac in ac_polar_available:
             ac = self.ac
         else:
-            if self.ac.startswith("a32"):
-                ac = "a320"
-            elif self.ac.startswith("a33"):
-                ac = "a332"
-            elif self.ac.startswith("a34"):
-                ac = "a333"
-            elif self.ac.startswith("a35"):
-                ac = "a359"
-            elif self.ac.startswith("a38"):
-                ac = "a388"
-            elif self.ac.startswith("b73"):
-                ac = "b738"
-            elif self.ac.startswith("b74"):
-                ac = "b744"
-            elif self.ac.startswith("b77"):
-                ac = "b777"
+            syno = polar_synonym.query("orig==@self.ac")
+            if self.use_synonym and syno.shape[0] > 0:
+                ac = syno.new.iloc[0]
             else:
-                raise RuntimeError("%s drag polar not avaiable." % self.ac.upper())
-
-            print("warning: %s drag polar used for %s." % (ac.upper(), self.ac.upper()))
+                raise RuntimeError(f"Drag polar for {self.ac} not avaiable in OpenAP.")
 
         f = dir_dragpolar + ac + ".yml"
         dragpolar = yaml.safe_load(open(f))
         return dragpolar
 
     @ndarrayconvert
-    def _calc_drag(self, mass, tas, alt, cd0, k, path_angle):
-        v = tas * aero.kts
-        h = alt * aero.ft
-        gamma = np.radians(path_angle)
+    def _cl(self, mass, tas, alt, path_angle):
+        v = tas * self.aero.kts
+        h = alt * self.aero.ft
+        gamma = path_angle * self.np.pi / 180
 
         S = self.aircraft["wing"]["area"]
 
-        rho = aero.density(h)
+        rho = self.aero.density(h)
         qS = 0.5 * rho * v ** 2 * S
-        L = mass * aero.g0 * np.cos(gamma)
-        qS = np.where(qS < 1e-3, 1e-3, qS)
+        L = mass * self.aero.g0 * self.np.cos(gamma)
+        qS = self.np.where(qS < 1e-3, 1e-3, qS)
+        cl = L / qS
+        return cl
+
+    @ndarrayconvert
+    def _calc_drag(self, mass, tas, alt, cd0, k, path_angle):
+        v = tas * self.aero.kts
+        h = alt * self.aero.ft
+        gamma = path_angle * self.np.pi / 180
+
+        S = self.aircraft["wing"]["area"]
+
+        rho = self.aero.density(h)
+        qS = 0.5 * rho * v ** 2 * S
+        L = mass * self.aero.g0 * self.np.cos(gamma)
+        qS = self.np.where(qS < 1e-3, 1e-3, qS)
         cl = L / qS
         cd = cd0 + k * cl ** 2
         D = cd * qS
-
-        D = D.astype(int)
-
         return D
 
     @ndarrayconvert
@@ -112,10 +119,23 @@ class Drag(object):
         k = self.polar["clean"]["k"]
 
         if self.wave_drag:
-            mach_crit = self.polar["mach_crit"]
-            mach = aero.tas2mach(tas * aero.kts, alt * aero.ft)
+            mach = self.aero.tas2mach(tas * self.aero.kts, alt * self.aero.ft)
+            cl = self._cl(mass, tas, alt, path_angle)
 
-            dCdw = np.where(mach > mach_crit, 20 * (mach - mach_crit) ** 4, 0)
+            sweep = math.radians(self.aircraft["wing"]["sweep"])
+            tc = self.aircraft["wing"]["t/c"]
+            if tc is None:
+                tc = 0.11
+
+            cos_sweep = math.cos(sweep)
+            mach_crit = (
+                0.87 - 0.108 / cos_sweep - 0.1 * cl / (cos_sweep ** 2) - tc / cos_sweep
+            ) / cos_sweep
+
+            dmach = self.np.where(mach - mach_crit <= 0, 0, mach - mach_crit)
+
+            dCdw = self.np.where(dmach, 20 * dmach ** 4, 0)
+
         else:
             dCdw = 0
 
@@ -126,7 +146,7 @@ class Drag(object):
 
     @ndarrayconvert
     def nonclean(self, mass, tas, alt, flap_angle, path_angle=0, landing_gear=False):
-        """Compute drag at at non-clean configuratio.
+        """Compute drag at at non-clean configuration.
 
         Args:
             mass (int or ndarray): Mass of the aircraft (unit: kg).
@@ -149,7 +169,10 @@ class Drag(object):
         SfS = self.polar["flaps"]["Sf/S"]
 
         delta_cd_flap = (
-            lambda_f * (cfc) ** 1.38 * (SfS) * np.sin(np.radians(flap_angle)) ** 2
+            lambda_f
+            * (cfc) ** 1.38
+            * (SfS)
+            * self.np.sin(flap_angle * self.np.pi / 180) ** 2
         )
 
         if landing_gear:
@@ -172,7 +195,7 @@ class Drag(object):
             delta_e_flap = 0.0026 * flap_angle
 
         ar = self.aircraft["wing"]["span"] ** 2 / self.aircraft["wing"]["area"]
-        k_total = 1 / (1 / k + np.pi * ar * delta_e_flap)
+        k_total = 1 / (1 / k + self.np.pi * ar * delta_e_flap)
 
         D = self._calc_drag(mass, tas, alt, cd0_total, k_total, path_angle)
         return D

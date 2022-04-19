@@ -1,4 +1,4 @@
-aircraft: Boeing 777-200ER
+aircraft: Boeing 777-200/200ER 
 
 fuselage:
   length:   63.73
@@ -34,8 +34,11 @@ engine:
   type: turbofan
   mount: wing
   number: 2
-  default: Trent 895
+  default: PW4090
   options:
-    - GE90-94B
+    - GE90-77B
     - PW4077
+    - Trent 877
+    - GE90-94B
+    - PW4090
     - Trent 895

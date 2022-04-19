@@ -5,33 +5,39 @@ import glob
 import yaml
 import numpy as np
 import pandas as pd
-from openap import aero
 
 curr_path = os.path.dirname(os.path.realpath(__file__))
 dir_aircraft = curr_path + "/data/aircraft/"
-db_engine = curr_path + "/data/engine/engines.txt"
+file_engine = curr_path + "/data/engine/engines.csv"
+file_synonym = curr_path + "/data/aircraft/_synonym.csv"
 
+aircraft_synonym = pd.read_csv(file_synonym) 
 
-def available_aircraft():
-    """Get avaiable aircraft types in OpenAP model.
+def available_aircraft(use_synonym=False):
+    """Get available aircraft types in OpenAP model.
 
     Returns:
         list of string: aircraft types.
 
     """
     files = sorted(glob.glob(dir_aircraft + "*.yml"))
-    acs = [f[-8:-4].upper() for f in files]
+    acs = [f[-8:-4] for f in files]
+
+    if use_synonym:
+        syno = aircraft_synonym.orig.to_list()
+        acs = acs + syno
+
     return acs
 
 
-def aircraft(ac):
+def aircraft(ac, use_synonym=False):
     """Get details of an aircraft type.
 
     Args:
         ac (string): ICAO aircraft type (for example: A320).
 
     Returns:
-        dict: Peformance parameters related to the aircraft.
+        dict: Performance parameters related to the aircraft.
 
     """
     ac = ac.lower()
@@ -39,7 +45,12 @@ def aircraft(ac):
     files = glob.glob(dir_aircraft + ac + ".yml")
 
     if len(files) == 0:
-        raise RuntimeError("Aircraft data not found.")
+        syno = aircraft_synonym.query('orig==@ac')
+        if use_synonym and syno.shape[0] > 0:
+            new_ac = syno.new.iloc[0]
+            files = glob.glob(dir_aircraft + new_ac + ".yml")
+        else:
+            raise RuntimeError(f"Aircraft {ac} not avaiable in OpenAP.")
 
     f = files[0]
     acdict = yaml.safe_load(open(f))
@@ -78,9 +89,9 @@ def search_engine(eng):
 
     """
     ENG = eng.strip().upper()
-    engines = pd.read_fwf(db_engine)
+    engines = pd.read_csv(file_engine)
 
-    available_engines = engines.query("name.str.startswith(@ENG)")
+    available_engines = engines.query("name.str.startswith(@ENG)", engine="python")
 
     if available_engines.shape[0] == 0:
         print("Engine not found.")
@@ -104,10 +115,12 @@ def engine(eng):
 
     """
     ENG = eng.strip().upper()
-    engines = pd.read_fwf(db_engine)
+    engines = pd.read_csv(file_engine)
 
     # try to look for the unique engine
-    available_engines = engines.query("name.str.upper().str.startswith(@ENG)")
+    available_engines = engines.query(
+        "name.str.upper().str.startswith(@ENG)", engine="python"
+    )
     if available_engines.shape[0] >= 1:
         available_engines.index = available_engines.name
 
@@ -120,12 +133,16 @@ def engine(eng):
             sfc_to = (seleng["fuel_c3"] + seleng["fuel_c2"] + seleng["fuel_c1"]) / (
                 seleng["max_thrust"] / 1000
             )
-            fuel_ch = np.round((sfc_cr - sfc_to) / (seleng["cruise_alt"] * aero.ft), 8)
+            fuel_ch = np.round((sfc_cr - sfc_to) / (seleng["cruise_alt"] * 0.3048), 8)
         else:
             fuel_ch = 6.7e-7
 
         seleng["fuel_ch"] = fuel_ch
     else:
-        raise RuntimeError("Engine data not found.")
+        raise RuntimeError(f"Data for engine {eng} not found.")
 
     return seleng
+
+
+def func_fuel(c3, c2, c1):
+    return lambda x: c3 * x ** 3 + c2 * x ** 2 + c1 * x

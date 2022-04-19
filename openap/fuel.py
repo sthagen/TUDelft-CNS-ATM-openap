@@ -1,15 +1,14 @@
 """OpenAP FuelFlow model."""
 
-import numpy as np
-from openap.extra import aero
-from openap import prop, Thrust, Drag
+import importlib
+from openap import prop
 from openap.extra import ndarrayconvert
 
 
 class FuelFlow(object):
-    """Fuel flow model based on ICAO emmision databank."""
+    """Fuel flow model based on ICAO emission databank."""
 
-    def __init__(self, ac, eng=None):
+    def __init__(self, ac, eng=None, **kwargs):
         """Initialize FuelFlow object.
 
         Args:
@@ -19,15 +18,28 @@ class FuelFlow(object):
                 by in the aircraft database.
 
         """
-        self.aircraft = prop.aircraft(ac)
+        if not hasattr(self, "np"):
+            self.np = importlib.import_module("numpy")
+
+        if not hasattr(self, "Thrust"):
+            self.Thrust = importlib.import_module("openap.thrust").Thrust
+
+        if not hasattr(self, "Drag"):
+            self.Drag = importlib.import_module("openap.drag").Drag
+
+        if not hasattr(self, "WRAP"):
+            self.WRAP = importlib.import_module("openap.kinematic").WRAP
+
+        self.aircraft = prop.aircraft(ac, **kwargs)
 
         if eng is None:
             eng = self.aircraft["engine"]["default"]
 
         self.engine = prop.engine(eng)
 
-        self.thrust = Thrust(ac, eng)
-        self.drag = Drag(ac)
+        self.thrust = self.Thrust(ac, eng, **kwargs)
+        self.drag = self.Drag(ac, **kwargs)
+        self.wrap = self.WRAP(ac, **kwargs)
 
         c3, c2, c1 = (
             self.engine["fuel_c3"],
@@ -36,7 +48,7 @@ class FuelFlow(object):
         )
         # print(c3,c2,c1)
 
-        self.fuel_flow_model = lambda x: c3 * x ** 3 + c2 * x ** 2 + c1 * x
+        self.func_fuel = prop.func_fuel(c3, c2, c1)
 
     @ndarrayconvert
     def at_thrust(self, acthr, alt=0):
@@ -44,7 +56,7 @@ class FuelFlow(object):
 
         Args:
             acthr (int or ndarray): The total net thrust of the aircraft (unit: N).
-            alt (int or ndarray): Aicraft altitude (unit: ft).
+            alt (int or ndarray): Aircraft altitude (unit: ft).
 
         Returns:
             float: Fuel flow (unit: kg/s).
@@ -53,10 +65,13 @@ class FuelFlow(object):
         n_eng = self.aircraft["engine"]["number"]
         engthr = acthr / n_eng
 
-        ratio = engthr / self.engine["max_thrust"]
+        # use maximum dynamic thrust at see-level as denominator
+        v_lof_max = self.wrap.takeoff_speed()["maximum"]
+        maxthr = self.thrust.takeoff(tas=v_lof_max / 0.5144, alt=0)
+        ratio = acthr / maxthr
 
-        ff_sl = self.fuel_flow_model(ratio)
-        ff_corr_alt = self.engine["fuel_ch"] * (engthr / 1000) * (alt * aero.ft)
+        ff_sl = self.func_fuel(ratio)
+        ff_corr_alt = self.engine["fuel_ch"] * (engthr / 1000) * (alt * 0.3048)
         ff_eng = ff_sl + ff_corr_alt
 
         fuelflow = ff_eng * n_eng
@@ -86,7 +101,7 @@ class FuelFlow(object):
         return fuelflow
 
     @ndarrayconvert
-    def enroute(self, mass, tas, alt, path_angle=0):
+    def enroute(self, mass, tas, alt, path_angle=0, fillna=True):
         """Compute the fuel flow during climb, cruise, or descent.
 
         The net thrust is first estimated based on the dynamic equation.
@@ -106,13 +121,18 @@ class FuelFlow(object):
         D = self.drag.clean(mass=mass, tas=tas, alt=alt, path_angle=path_angle)
 
         # Convert angles from degrees to radians.
-        gamma = np.radians(path_angle)
+        gamma = path_angle * self.np.pi / 180
 
-        T = D + mass * aero.g0 * np.sin(gamma)
+        T = D + mass * 9.80665 * self.np.sin(gamma)
         T_idle = self.thrust.descent_idle(tas=tas, alt=alt)
-        T = np.where(T < 0, T_idle, T)
+        T = self.np.where(T < 0, T_idle, T)
 
         fuelflow = self.at_thrust(T, alt)
+
+        # do not performa calculation outside performance boundary (with margin of 20%)
+        if fillna:
+            T_max = self.thrust.climb(tas=tas, alt=alt, roc=0)
+            fuelflow = self.np.where(T > 1.20 * T_max, self.np.nan, fuelflow)
 
         return fuelflow
 
@@ -128,8 +148,8 @@ class FuelFlow(object):
         """
         import matplotlib.pyplot as plt
 
-        xx = np.linspace(0, 1, 50)
-        yy = self.fuel_flow_model(xx)
+        xx = self.np.linspace(0, 1, 50)
+        yy = self.func_fuel(xx)
         # plt.scatter(self.x, self.y, color='k')
         plt.plot(xx, yy, "--", color="gray")
         if plot:
