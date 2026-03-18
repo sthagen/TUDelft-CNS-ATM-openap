@@ -11,7 +11,7 @@ from openap.backends import BackendType
 # Type alias for numeric inputs (scalar, array, or symbolic)
 Numeric = Any
 from openap.extra import ndarrayconvert
-from openap.extra.aero import fpm, kts
+from openap.aero import fpm, kts
 
 from .base import FuelFlowBase
 
