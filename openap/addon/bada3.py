@@ -302,14 +302,23 @@ class Drag(base.DragBase):
         cd = cd0 + cd0_lg + cd2 * cl**2
         return cd
 
+    def clean_drag_polar_params(self, tas=None, alt=None, dT=0):
+        """Return clean-configuration drag polar parameters.
+
+        BADA3 clean drag is CD = cd0 + cd2 * CL**2. The optional
+        arguments are accepted for API symmetry with Mach-dependent models.
+        """
+        return {"cd0": self.cd0_cr, "cd2": self.cd2_cr, "cd6": 0.0}
+
     @ndarrayconvert(column=True)
-    def _cl(self, mass, tas, alt):
+    def _cl(self, mass, tas, alt, dT=0):
         """Compute lift coefficient (BADA3 eq. 3.6-1).
 
         Args:
             mass: Mass of the aircraft (kg).
             tas: True airspeed (kt).
             alt: Geopotential pressure altitude (ft).
+            dT: ISA temperature deviation (K). Defaults to 0.
 
         Returns:
             Tuple of (lift coefficient, q * S).
@@ -317,17 +326,17 @@ class Drag(base.DragBase):
         """
         v = tas * self.aero.kts
         h = alt * self.aero.ft
-        rho = self.aero.density(h)
+        rho = self.aero.density(h, dT=dT)
 
         # calculate total lift
         qS = 0.5 * rho * v**2 * self.S
         L = mass * self.aero.g0
-        cl = L / self.sci.maximum(qS, 1e-3)  # avoid zero division
+        cl = L / self.backend.maximum(qS, 1e-3)  # avoid zero division
 
         return cl, qS
 
     @ndarrayconvert(column=True)
-    def clean(self, mass, tas, alt, vs=None) -> float | ndarray:
+    def clean(self, mass, tas, alt, vs=None, dT=0) -> float | ndarray:
         """Compute drag in clean configuration (BADA3 eq. 3.6-5).
 
         Args:
@@ -335,18 +344,19 @@ class Drag(base.DragBase):
             tas: True airspeed (kt).
             alt: Geopotential pressure altitude (ft).
             vs: Unused.
+            dT: ISA temperature deviation (K). Defaults to 0.
 
         Returns:
             Total drag in clean configuration (N).
 
         """
-        cl, qS = self._cl(mass, tas, alt)
+        cl, qS = self._cl(mass, tas, alt, dT=dT)
         cd = self._cd(cl, self.cd0_cr, self.cd2_cr)
         D = cd * qS
         return D
 
     @ndarrayconvert(column=True)
-    def nonclean(self, mass, tas, alt, landing_gear=False, phase=None):
+    def nonclean(self, mass, tas, alt, landing_gear=False, phase=None, dT=0):
         """Compute drag in non-clean configuration (BADA3 eq. 3.6-3, 3.6-4, 3.6-5).
 
         Args:
@@ -355,6 +365,7 @@ class Drag(base.DragBase):
             alt: Geopotential pressure altitude (ft).
             landing_gear: Whether landing gear is extended. Defaults to False.
             phase: Flight phase, one of 'AP' or 'LD'.
+            dT: ISA temperature deviation (K). Defaults to 0.
 
         Returns:
             Total drag in non-clean configuration (N).
@@ -363,7 +374,7 @@ class Drag(base.DragBase):
         # ensure that the phase is one of AP or LD
         if phase not in ("AP", "LD"):
             raise ValueError(f"Phase {phase} unknown or not applicable.")
-        cl, qS = self._cl(mass, tas, alt)
+        cl, qS = self._cl(mass, tas, alt, dT=dT)
         if phase == "AP":
             # if both cd0 and cd2 of approach are zero, use clean config
             if self.cd0_ap == 0.0 and self.cd2_ap == 0.0:
@@ -406,9 +417,9 @@ class Thrust(base.ThrustBase):
             model["CD2"]["AP"],
             model["CD2"]["LD"],
         ]
-        nc_avail = all(val == 0 for val in nc_vals)
+        nc_avail = not all(val == 0 for val in nc_vals)
         if nc_avail:
-            self.hpdes = self.sci.maximum(model["HpDes"], 8000.0)
+            self.hpdes = self.backend.maximum(model["HpDes"], 8000.0)
         else:
             self.hpdes = model["HpDes"]
 
@@ -439,8 +450,9 @@ class Thrust(base.ThrustBase):
         # correct for temperature deviations from ISA whilst considering limits
         # eq. (3.7.4 - 3.7.7)
         dT_eff = dT - self.ct[3]
-        c_tc5 = self.sci.maximum(self.ct[4], 0.0)
-        dT_lim = self.sci.maximum(0.0, self.sci.minimum(c_tc5 * dT_eff, 0.4))
+        b = self.backend
+        c_tc5 = b.maximum(self.ct[4], 0.0)
+        dT_lim = b.maximum(0.0, b.minimum(c_tc5 * dT_eff, 0.4))
         thr_mcl = thr_isa * (1 - dT_lim)
         return thr_mcl
 
@@ -496,16 +508,15 @@ class Thrust(base.ThrustBase):
         thr_cl_max = self.climb(tas, alt, dT)
         if config not in ("CR", "AP", "LD"):
             raise ValueError("Config unknown.")
-        if alt > self.hpdes:
-            thr_des = self.ctdeshigh * thr_cl_max
+        if config == "CR":
+            ctdes = self.ctdeslow
+        elif config == "AP":
+            ctdes = self.ctdesapp
         else:
-            if config == "CR":
-                ctdes = self.ctdeslow
-            elif config == "AP":
-                ctdes = self.ctdesapp
-            else:
-                ctdes = self.ctdesld
-            thr_des = ctdes * thr_cl_max
+            ctdes = self.ctdesld
+        thr_des = self.backend.where(
+            alt > self.hpdes, self.ctdeshigh * thr_cl_max, ctdes * thr_cl_max
+        )
         return thr_des
 
 
@@ -517,8 +528,8 @@ class FuelFlow(base.FuelFlowBase):
         self.ac = ac.upper()
         if not model:
             model = load_bada3(ac, bada_path)
-        self.thrust = Thrust(ac, bada_path, model=model)
-        self.drag = Drag(ac, bada_path, model=model)
+        self.thrust = Thrust(ac, bada_path, model=model, backend=self.backend)
+        self.drag = Drag(ac, bada_path, model=model, backend=self.backend)
         # load parameters from BADA3
         self.engine_type = model["engine"]["type"]
         self.cf1 = model["Cf"][0]
@@ -528,7 +539,7 @@ class FuelFlow(base.FuelFlowBase):
         self.cfcr = model["CfCrz"]
 
     @ndarrayconvert(column=True)
-    def nominal(self, mass, tas, alt, vs=0) -> float | ndarray:
+    def nominal(self, mass, tas, alt, vs=0, dT=0) -> float | ndarray:
         """Calculate nominal fuel flow (BADA3 eq. 3.9-1, 3.9-2, 3.9-3).
 
         Args:
@@ -536,6 +547,7 @@ class FuelFlow(base.FuelFlowBase):
             tas: True airspeed (kt).
             alt: Geopotential pressure altitude (ft).
             vs: Vertical rate (ft/min). Defaults to 0.
+            dT: ISA temperature deviation (K). Defaults to 0.
 
         Returns:
             Nominal fuel flow (kg/s).
@@ -543,12 +555,13 @@ class FuelFlow(base.FuelFlowBase):
         """
         # calculate gamma angle and drag
         v = tas * self.aero.kts
-        gamma = self.sci.arctan2(vs * self.aero.fpm, v)
-        D = self.drag.clean(mass, tas, alt, vs)
+        gamma = self.backend.arctan2(vs * self.aero.fpm, v)
+        D = self.drag.clean(mass, tas, alt, vs, dT=dT)
 
         # thrust is equal to drag, but not larger than climb thrust
-        T = self.sci.minimum(
-            D + mass * self.aero.g0 * self.sci.sin(gamma), self.thrust.climb(tas, alt)
+        T = self.backend.minimum(
+            D + mass * self.aero.g0 * self.backend.sin(gamma),
+            self.thrust.climb(tas, alt, dT=dT),
         )
 
         # calculate nominal fuel flow depending on engine_type
@@ -564,12 +577,12 @@ class FuelFlow(base.FuelFlowBase):
             raise ValueError("Unknown engine type.")
 
         # nominal must be at least idle
-        f_nom = self.sci.maximum(f_nom, self.idle(mass, tas, alt, vs))
+        f_nom = self.backend.maximum(f_nom, self.idle(mass, tas, alt, vs))
         return f_nom / 60.0  # conversion [kg/min] -> [kg/s]
 
     @ndarrayconvert(column=True)
-    def enroute(self, mass, tas, alt, vs=0, acc=None):
-        """Calculate cruise (clean) fuel flow (BADA3 eq. 3.9-6).
+    def enroute(self, mass, tas, alt, vs=0, acc=None, dT=0):
+        """Calculate nominal enroute fuel flow.
 
         Args:
             mass: Mass of the aircraft (kg).
@@ -577,12 +590,32 @@ class FuelFlow(base.FuelFlowBase):
             alt: Geopotential pressure altitude (ft).
             vs: Vertical rate (ft/min). Defaults to 0.
             acc: Unused.
+            dT: ISA temperature deviation (K). Defaults to 0.
+
+        Returns:
+            Nominal fuel flow (kg/s).
+
+        """
+        f_nom = self.nominal(mass, tas, alt, vs, dT=dT)  # [kg/s]
+        return f_nom
+
+    @ndarrayconvert(column=True)
+    def cruise(self, mass, tas, alt, vs=0, acc=None, dT=0):
+        """Calculate cruise fuel flow with the BADA3 cruise correction (eq. 3.9-6).
+
+        Args:
+            mass: Mass of the aircraft (kg).
+            tas: True airspeed (kt).
+            alt: Geopotential pressure altitude (ft).
+            vs: Vertical rate (ft/min). Defaults to 0.
+            acc: Unused.
+            dT: ISA temperature deviation (K). Defaults to 0.
 
         Returns:
             Cruise fuel flow (kg/s).
 
         """
-        f_nom = self.nominal(mass, tas, alt, vs)  # [kg/s]
+        f_nom = self.nominal(mass, tas, alt, vs, dT=dT)  # [kg/s]
         return self.cfcr * f_nom
 
     @ndarrayconvert(column=True)
@@ -608,7 +641,7 @@ class FuelFlow(base.FuelFlowBase):
         return f_min / 60.0  # conversion [kg/min] -> [kg/s]
 
     @ndarrayconvert(column=True)
-    def approach(self, mass, tas, alt, vs=0):
+    def approach(self, mass, tas, alt, vs=0, dT=0):
         """Calculate approach/landing fuel flow (BADA3 eq. 3.9-5).
 
         Only applicable to jet and turboprop aircraft.
@@ -618,6 +651,7 @@ class FuelFlow(base.FuelFlowBase):
             tas: True airspeed (kt).
             alt: Geopotential pressure altitude (ft).
             vs: Vertical rate (ft/min). Defaults to 0.
+            dT: ISA temperature deviation (K). Defaults to 0.
 
         Returns:
             Approach/landing fuel flow (kg/s).
@@ -627,7 +661,7 @@ class FuelFlow(base.FuelFlowBase):
             raise ValueError(
                 f"Engine type {self.engine_type} unknown or not applicable."
             )
-        f_nom = self.nominal(mass, tas, alt, vs)  # [kg/s]
+        f_nom = self.nominal(mass, tas, alt, vs, dT=dT)  # [kg/s]
         f_min = self.idle(mass, tas, alt, vs)  # [kg/s]
-        f_ap = self.sci.maximum(f_nom, f_min)
+        f_ap = self.backend.maximum(f_nom, f_min)
         return f_ap
