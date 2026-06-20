@@ -9,14 +9,32 @@ from ..extra import ndarrayconvert
 
 
 # %%
-def load_bada4(ac: str, path: str) -> ElementTree:
-    """Find and construct the drag polar model.
+def _poly1(coefficients, x, exponents):
+    total = 0.0
+    for coefficient, exponent in zip(coefficients, exponents):
+        total = total + coefficient * x**exponent
+    return total
+
+
+def _poly2(coefficients, shape, row_terms, col_terms):
+    rows, cols = shape
+    total = 0.0
+    for i in range(rows):
+        for j in range(cols):
+            total = total + coefficients[i * cols + j] * row_terms[i] * col_terms[j]
+    return total
+
+
+def load_bada4(ac: str, path: str) -> ElementTree.ElementTree:
+    """Load BADA4 model XML.
+
     Args:
-        ac (str): aircraft type (for example: A320 or A320-231).
-        bada_path (str): path to BADA4 models.
+        ac: Aircraft type (for example: A320 or A320-231).
+        path: Path to BADA4 models.
 
     Returns:
-        xml.etree.ElementTree: BADA4 model XML.
+        BADA4 model XML tree.
+
     """
 
     ac_options = glob(f"{path}/{ac.upper()}*")
@@ -32,39 +50,14 @@ def load_bada4(ac: str, path: str) -> ElementTree:
 
 # %%
 class Drag(base.DragBase):
-    """
-    Compute the drag of an aircraft using BADA4 models.
+    """Compute the drag of an aircraft using BADA4 models."""
 
-    Attributes:
-        ac (str): aircraft type (e.g.: A320 or A320-231).
-        scalar (float): Scalar value for drag coefficient calculation.
-        d_ (ndarray): Array of drag coefficient parameters.
-        mach_max (float): Maximum Mach number.
-        S (float): Wing surface area (m^2).
-
-    Methods:
-        _cd_base(cl, mach):
-            Compute the base drag coefficient (CD) for givenlift coefficient (CL)
-            and Mach number.
-
-        _cd(cl, mach):
-            Compute the drag coefficient (CD) for given lift coefficient (CL)
-            and Mach number, considering critical Mach number effects.
-
-        _cl(mass, tas, alt, vs=0):
-            Compute the lift coefficient (CL) for given aircraft mass,
-            true airspeed (TAS), altitude, and vertical speed.
-
-        clean(mass, tas, alt, vs=0):
-            Compute the total drag (N) for the aircraft in clean configuration.
-    """
-
-    def __init__(self, ac, bada_path, **kwargs):
+    def __init__(self, ac: str, bada_path: str, **kwargs):
         """Initialize Drag object.
 
         Args:
-            ac (str): aircraft type (for example: A320).
-            path (str): path to BADA4 models.
+            ac: Aircraft type (for example: A320).
+            bada_path: Path to BADA4 models.
 
         """
         super().__init__(ac, **kwargs)
@@ -74,9 +67,7 @@ class Drag(base.DragBase):
         # load parameters from xml
         bxml = load_bada4(ac, bada_path)
         self.scalar = float(bxml.findtext(".//*/DPM_clean/scalar"))
-        self.d_ = self.sci.array(
-            [float(v.text) for v in bxml.findall(".//*/CD_clean/d")]
-        )
+        self.d_ = [float(v.text) for v in bxml.findall(".//*/CD_clean/d")]
         self.mach_max = float(bxml.findtext(".//*/DPM_clean/M_max"))
         self.S = float(bxml.findtext("./AFCM/S"))
 
@@ -84,24 +75,50 @@ class Drag(base.DragBase):
     def _cd_base(self, cl, mach):
         mm = (1 - mach**2) ** (-0.5)
 
-        C0 = self.sci.dot(
-            self.sci.array([mm[:, 0] ** i for i in range(5)]).T,
-            self.d_[0:5].reshape(5, 1),
-        )
-
-        C2 = self.sci.dot(
-            self.sci.array([mm[:, 0] ** i for i in range(0, 13, 3)]).T,
-            self.d_[5:10].reshape(5, 1),
-        )
-
-        C6 = self.d_[10] + self.sci.dot(
-            self.sci.array([mm[:, 0] ** i for i in range(14, 18)]).T,
-            self.d_[11:15].reshape(4, 1),
-        )
+        C0 = _poly1(self.d_[0:5], mm, range(5))
+        C2 = _poly1(self.d_[5:10], mm, range(0, 13, 3))
+        C6 = self.d_[10] + _poly1(self.d_[11:15], mm, range(14, 18))
 
         cd = self.scalar * (C0 + C2 * cl**2 + C6 * cl**6)
 
         return cd
+
+    def _cd_params_base(self, mach):
+        mm = (1 - mach**2) ** (-0.5)
+        return {
+            "cd0": self.scalar * _poly1(self.d_[0:5], mm, range(5)),
+            "cd2": self.scalar * _poly1(self.d_[5:10], mm, range(0, 13, 3)),
+            "cd6": self.scalar
+            * (self.d_[10] + _poly1(self.d_[11:15], mm, range(14, 18))),
+        }
+
+    def clean_drag_polar_params(self, tas, alt, dT=0):
+        """Return clean-configuration drag polar parameters.
+
+        BADA4 clean drag is CD = cd0(M) + cd2(M) * CL**2 + cd6(M) * CL**6.
+        The returned parameters include the same Mach-divergence correction
+        used by :meth:`clean`.
+        """
+        v = tas * self.aero.kts
+        h = alt * self.aero.ft
+        mach = self.aero.tas2mach(v, h, dT=dT)
+
+        mach_base = self.mach_max - 0.01
+        divergent = self.backend.maximum((mach - mach_base) / 0.01, 0)
+
+        base = self._cd_params_base(mach)
+        at_base = self._cd_params_base(mach_base)
+        at_max = self._cd_params_base(self.mach_max)
+
+        params = {}
+        for name in ("cd0", "cd2", "cd6"):
+            divergent_value = at_base[name] + divergent**1.5 * (
+                at_max[name] - at_base[name]
+            )
+            params[name] = self.backend.where(
+                mach < self.mach_max, base[name], divergent_value
+            )
+        return params
 
     @ndarrayconvert(column=True)
     def _cd(self, cl, mach):
@@ -115,45 +132,45 @@ class Drag(base.DragBase):
         cd_mach_base = self._cd_base(cl, mach_base)
 
         divergent = (mach - mach_base) / 0.01
-        divergent = self.sci.maximum(divergent, 0)
+        divergent = self.backend.maximum(divergent, 0)
         cd_crit = cd_mach_base + divergent**1.5 * (cd_mach_max - cd_mach_base)
 
-        cd = self.sci.where(mach < self.mach_max, cd, cd_crit)
+        cd = self.backend.where(mach < self.mach_max, cd, cd_crit)
 
         return cd
 
     @ndarrayconvert(column=True)
-    def _cl(self, mass, tas, alt, vs=0):
+    def _cl(self, mass, tas, alt, vs=0, dT=0):
         v = tas * self.aero.kts
         h = alt * self.aero.ft
-        rho = self.aero.density(h)
+        rho = self.aero.density(h, dT=dT)
 
         qS = 0.5 * rho * v**2 * self.S
         L = mass * self.aero.g0
 
-        cl = L / self.sci.maximum(qS, 1e-3)  # avoid zero division
+        cl = L / self.backend.maximum(qS, 1e-3)  # avoid zero division
 
         return cl, qS
 
     @ndarrayconvert(column=True)
-    def clean(self, mass, tas, alt, vs=0) -> float | ndarray:
+    def clean(self, mass, tas, alt, vs=0, dT=0) -> float | ndarray:
         """Compute drag at clean configuration.
 
         Args:
-            mass (float | ndarray): Mass of the aircraft (kg).
-            tas (float | ndarray): True airspeed (kt).
-            alt (float | ndarray): Altitude (ft).
-            vs (float): Vertical rate (feet/min). Default: 0.
+            mass: Mass of the aircraft (kg).
+            tas: True airspeed (kt).
+            alt: Altitude (ft).
+            vs: Vertical rate (ft/min). Defaults to 0.
 
         Returns:
-            float | ndarray: Total drag (N).
+            Total drag (N).
 
         """
         v = tas * self.aero.kts
         h = alt * self.aero.ft
-        mach = self.aero.tas2mach(v, h)
+        mach = self.aero.tas2mach(v, h, dT=dT)
 
-        cl, qS = self._cl(mass, tas, alt, vs)
+        cl, qS = self._cl(mass, tas, alt, vs, dT=dT)
         cd = self._cd(cl, mach)
         D = cd * qS
 
@@ -161,36 +178,14 @@ class Drag(base.DragBase):
 
 
 class Thrust(base.ThrustBase):
-    """
-    Thrust class for computing the thrust of an aircraft using BADA4 models.
+    """Compute the thrust of an aircraft using BADA4 models."""
 
-    This class provides methods to compute the thrust coefficient and thrust force
-    during different phases of flight such as climb, cruise, and takeoff.
-
-    Attributes:
-        ac (str): aircraft type (e.g.: A320 or A320-231).
-        a_ (list): List of coefficients for thrust computation.
-        b_ (dict): Dictionary of flat rating coefficients for different ratings.
-        c_ (dict): Dictionary of temperature rating coefficients for different ratings.
-
-    Methods:
-        cT(mach, h, rating, dT=0):
-            Compute the thrust coefficient considering altitude, Mach, and rating.
-        climb(mass, tas, alt, dT=0):
-            Compute the thrust force during climb phase.
-        cruise(mass, tas, alt, dT=0):
-            Compute the thrust force during cruise phase.
-        takeoff(mass, tas, alt=0, dT=0):
-            Compute the thrust force during takeoff phase.
-
-    """
-
-    def __init__(self, ac, bada_path, **kwargs):
+    def __init__(self, ac: str, bada_path: str, **kwargs):
         """Initialize Thrust object.
 
         Args:
-            ac (str): aircraft type (for example: A320).
-            path (str): path to BADA4 models.
+            ac: Aircraft type (for example: A320).
+            bada_path: Path to BADA4 models.
 
         """
         super().__init__(ac, **kwargs)
@@ -206,8 +201,11 @@ class Thrust(base.ThrustBase):
         self.b_ = dict()
         self.c_ = dict()
 
-        for rating in ["MCRZ", "MCMB"]:
-            self.kink[rating] = float(bxml.findtext(f"./PFM/TFM/{rating}/kink"))
+        for rating in ["MCRZ", "MCMB", "MTKF"]:
+            kink = bxml.findtext(f"./PFM/TFM/{rating}/kink")
+            if kink is None:
+                continue
+            self.kink[rating] = float(kink)
             self.b_[rating] = [
                 float(t.text) for t in bxml.findall(f"./PFM/TFM/{rating}/flat_rating/b")
             ]
@@ -218,63 +216,72 @@ class Thrust(base.ThrustBase):
 
     @ndarrayconvert(column=True)
     def cT(self, mach, h, rating, dT=0) -> float | ndarray:
-        """
-        Compute the thrust coefficient, considering the altitude, Mach, and rating.
+        """Compute the thrust coefficient.
+
+        Args:
+            mach: Mach number.
+            h: Altitude (m).
+            rating: Thrust rating ('MCRZ', 'MCMB', 'MTKF', or 'LIDL').
+            dT: ISA temperature deviation (K). Defaults to 0.
+
+        Returns:
+            Thrust coefficient.
+
         """
 
         rating = rating.upper()
-        assert rating in ["MCRZ", "MCMB", "LIDL"]
+        assert rating in ["MCRZ", "MCMB", "MTKF", "LIDL"]
 
         k = 1.4
 
-        delta = self.aero.pressure(h) / self.aero.p0
-        theta = self.aero.temperature(h) / self.aero.T0
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
+        theta = self.aero.temperature(h, dT=dT) / self.aero.T0
 
         if rating == "LIDL":
-            ti_matrix = self.sci.reshape(self.ti, (3, 4))
-
-            delta_pow = self.sci.array([delta**i for i in range(-1, 3)]).reshape(4, -1)
-            mach_pow = self.sci.array([mach**i for i in range(3)]).reshape(3, -1)
-            cT = self.sci.einsum("ij,jk,ik->k", ti_matrix, delta_pow, mach_pow)
+            delta_terms = [delta**i for i in range(-1, 3)]
+            mach_terms = [mach**i for i in range(3)]
+            cT = _poly2(self.ti, (3, 4), mach_terms, delta_terms)
 
         else:
-            if dT <= self.kink[rating]:
-                b_matrix = self.sci.reshape(self.b_[rating], (6, 6))
-                mach_pow = self.sci.array([mach**i for i in range(6)]).reshape(6, -1)
-                ratio_pow = self.sci.array([delta**j for j in range(6)]).reshape(6, -1)
-                delta_T = self.sci.einsum("ij,jk,ik->k", b_matrix, mach_pow, ratio_pow)
-            else:
-                c_matrix = self.sci.reshape(self.c_[rating], (9, 5))
-                mach_pow = self.sci.array([mach**i for i in range(5)]).reshape(5, -1)
-                theta_t = theta * (1 + (mach**2) * (k - 1) / 2)
-                ratio_pow = self.sci.array(
-                    [theta_t**j for j in range(5)] + [delta**j for j in range(1, 5)]
-                ).reshape(9, -1)
-                delta_T = self.sci.einsum("ij,jk,ik->k", c_matrix, mach_pow, ratio_pow)
+            b = self.backend
+            mach_terms_6 = [mach**i for i in range(6)]
+            delta_terms_6 = [delta**i for i in range(6)]
+            flat_delta_T = _poly2(
+                self.b_[rating], (6, 6), delta_terms_6, mach_terms_6
+            )
 
-            a_matrix = self.sci.reshape(self.a_, (6, 6))
-            mach_pow = self.sci.array([mach**i for i in range(6)]).reshape(6, -1)
-            delta_T_pow = self.sci.array([delta_T**j for j in range(6)]).reshape(6, -1)
-            cT = self.sci.einsum("ij,jk,ik->k", a_matrix, mach_pow, delta_T_pow)
+            mach_terms_5 = [mach**i for i in range(5)]
+            theta_t = theta * (1 + (mach**2) * (k - 1) / 2)
+            temp_terms = [theta_t**i for i in range(5)] + [
+                delta**i for i in range(1, 5)
+            ]
+            temp_delta_T = _poly2(
+                self.c_[rating], (9, 5), temp_terms, mach_terms_5
+            )
+            delta_T = b.where(dT <= self.kink[rating], flat_delta_T, temp_delta_T)
+
+            delta_T_terms = [delta_T**i for i in range(6)]
+            cT = _poly2(self.a_, (6, 6), delta_T_terms, mach_terms_6)
 
         return cT
 
     @ndarrayconvert(column=True)
     def climb(self, tas, alt, dT=0) -> float | ndarray:
-        """
-        Compute the thrust force during the climb phase.
+        """Compute the thrust force during the climb phase.
 
-        Parameters:
-            tas (float | ndarray): True airspeed (kts).
-            alt (float | ndarray): Altitude (ft).
-            dT (float | ndarray, optional): ISA temperature deviation (K). Default: 0.
+        Args:
+            tas: True airspeed (kt).
+            alt: Altitude (ft).
+            dT: ISA temperature deviation (K). Defaults to 0.
+
         Returns:
-            float | ndarray: The thrust force during the climb phase in Newtons.
+            Thrust force during climb (N).
+
         """
         h = alt * self.aero.ft
         v = tas * self.aero.kts
-        mach = self.aero.tas2mach(v, h)
-        delta = self.aero.pressure(h) / self.aero.p0
+        mach = self.aero.tas2mach(v, h, dT=dT)
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
 
         cT = self.cT(mach, h, "MCMB", dT)
 
@@ -282,20 +289,21 @@ class Thrust(base.ThrustBase):
 
     @ndarrayconvert(column=True)
     def cruise(self, tas, alt, dT=0) -> float | ndarray:
-        """
-        Compute the thrust force during the cruise phase.
+        """Compute the thrust force during the cruise phase.
 
-        Parameters:
-            tas (float | ndarray): True airspeed (kts).
-            alt (float | ndarray): Altitude (ft).
-            dT (float | ndarray, optional): ISA temperature deviation (K). Default: 0.
+        Args:
+            tas: True airspeed (kt).
+            alt: Altitude (ft).
+            dT: ISA temperature deviation (K). Defaults to 0.
+
         Returns:
-            float | ndarray: The thrust force during the climb phase in Newtons.
+            Thrust force during cruise (N).
+
         """
         h = alt * self.aero.ft
         v = tas * self.aero.kts
-        mach = self.aero.tas2mach(v, h)
-        delta = self.aero.pressure(h) / self.aero.p0
+        mach = self.aero.tas2mach(v, h, dT=dT)
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
 
         cT = self.cT(mach, h, "MCRZ", dT)
 
@@ -303,34 +311,44 @@ class Thrust(base.ThrustBase):
 
     @ndarrayconvert(column=True)
     def takeoff(self, tas, alt=0, dT=0) -> float | ndarray:
-        """
-        Compute the thrust force at takeoff
+        """Compute the thrust force at takeoff.
 
-        Parameters:
-            tas (float | ndarray): True airspeed (kts).
-            alt (float | ndarray): Altitude (ft). Default: 0.
-            dT (float | ndarray, optional): ISA temperature deviation (K). Default: 0.
+        Args:
+            tas: True airspeed (kt).
+            alt: Altitude (ft). Defaults to 0.
+            dT: ISA temperature deviation (K). Defaults to 0.
+
         Returns:
-            float | ndarray: The thrust force during the climb phase in Newtons.
-        """
-        return self.climb(tas, alt=alt, dT=dT)
+            Thrust force during takeoff (N).
 
-    @ndarrayconvert(column=True)
-    def idle(self, tas, alt=0, dT=0) -> float | ndarray:
-        """
-        Compute the idle thrust
-
-        Parameters:
-            tas (float | ndarray): True airspeed (kts).
-            alt (float | ndarray): Altitude (ft). Default: 0.
-            dT (float | ndarray, optional): ISA temperature deviation (K). Default: 0.
-        Returns:
-            float | ndarray: The thrust force during the climb phase in Newtons.
         """
         h = alt * self.aero.ft
         v = tas * self.aero.kts
-        mach = self.aero.tas2mach(v, h)
-        delta = self.aero.pressure(h) / self.aero.p0
+        mach = self.aero.tas2mach(v, h, dT=dT)
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
+
+        rating = "MTKF" if "MTKF" in self.kink else "MCMB"
+        cT = self.cT(mach, h, rating, dT)
+
+        return delta * self.m_ref * self.aero.g0 * cT
+
+    @ndarrayconvert(column=True)
+    def idle(self, tas, alt=0, dT=0) -> float | ndarray:
+        """Compute the idle thrust.
+
+        Args:
+            tas: True airspeed (kt).
+            alt: Altitude (ft). Defaults to 0.
+            dT: ISA temperature deviation (K). Defaults to 0.
+
+        Returns:
+            Idle thrust force (N).
+
+        """
+        h = alt * self.aero.ft
+        v = tas * self.aero.kts
+        mach = self.aero.tas2mach(v, h, dT=dT)
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
 
         cT = self.cT(mach, h, "LIDL", dT)
 
@@ -339,37 +357,20 @@ class Thrust(base.ThrustBase):
 
 # %%
 class FuelFlow(base.FuelFlowBase):
-    """
-    FuelFlow class to compute the fuel flow of an aircraft using BADA4 models.
+    """Compute the fuel flow of an aircraft using BADA4 models."""
 
-    Attributes:
-        ac (str): aircraft type (e.g.: A320 or A320-231).
-        mass_ref (float): Reference mass (kg).
-        f_ (list): List of coefficients for fuel flow computation.
-        fi_ (list): List of coefficients for idle rating.
-        lhv (float): Lower heating value (J/kg).
-
-    Methods:
-        idle(mass, tas, alt, **kwargs):
-            Compute the fuel flow with idle rating.
-
-        enroute(mass, tas, alt, vs=0, **kwargs):
-            Compute the fuel flow at not-idle.
-
-    """
-
-    def __init__(self, ac, bada_path, **kwargs):
+    def __init__(self, ac: str, bada_path: str, **kwargs):
         """Initialize FuelFlow object.
 
         Args:
-            ac (str): aircraft type (for example: A320).
-            path (str): path to BADA4 models.
+            ac: Aircraft type (for example: A320).
+            bada_path: Path to BADA4 models.
 
         """
         super().__init__(ac, **kwargs)
         self.ac = ac.upper()
-        self.thrust = Thrust(ac, bada_path)
-        self.drag = Drag(ac, bada_path)
+        self.thrust = Thrust(ac, bada_path, backend=self.backend)
+        self.drag = Drag(ac, bada_path, backend=self.backend)
 
         # load parameters from xml
         bxml = load_bada4(ac, bada_path)
@@ -395,26 +396,28 @@ class FuelFlow(base.FuelFlowBase):
         """Compute the fuel flow at idle conditions.
 
         Args:
-            mass (float | ndarray): Aircraft mass (kg).
-            tas (float | ndarray): Aircraft true airspeed (kt).
-            alt (float | ndarray): Aircraft altitude (ft).
+            mass: Aircraft mass (kg).
+            tas: Aircraft true airspeed (kt).
+            alt: Aircraft altitude (ft).
+            dT: Temperature deviation (K). Defaults to 0.
 
         Returns:
-            float: Fuel flow (kg/s).
+            Fuel flow (kg/s).
 
         """
 
         h = alt * self.aero.ft
         v = tas * self.aero.kts
-        mach = self.aero.tas2mach(v, h)
-        delta = self.aero.pressure(h) / self.aero.p0
-        theta = self.aero.temperature(h) / self.aero.T0
+        dT = kwargs.get("dT", 0)
 
-        fi_matrix = self.sci.reshape(self.fi_, (3, 3))
-        delta_powers = self.sci.array([delta**i for i in range(3)]).reshape(3, -1)
-        mach_powers = self.sci.array([mach**i for i in range(3)]).reshape(3, -1)
+        mach = self.aero.tas2mach(v, h, dT=dT)
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
+        theta = self.aero.temperature(h, dT=dT) / self.aero.T0
 
-        cF_idle = self.sci.einsum("ij,jk,ik->k", fi_matrix, delta_powers, mach_powers)
+        delta_terms = [delta**i for i in range(3)]
+        mach_terms = [mach**i for i in range(3)]
+        cF_idle = _poly2(self.fi_, (3, 3), mach_terms, delta_terms)
+        cF_idle = cF_idle * delta**-1 * theta**-0.5
 
         fuel_flow = self._calc_fuel(mass, delta, theta, cF_idle)
 
@@ -422,40 +425,40 @@ class FuelFlow(base.FuelFlowBase):
 
     @ndarrayconvert(column=True)
     def enroute(self, mass, tas, alt, vs=0, **kwargs) -> float | ndarray:
-        """Compute the fuel flow at not-idle conditions.
+        """Compute the fuel flow at non-idle conditions.
 
         Args:
-            mass (float | ndarray): Aircraft mass (kg).
-            tas (float | ndarray): Aircraft true airspeed (kt).
-            alt (float | ndarray): Aircraft altitude (ft).
-            vs (float | ndarray): Vertical rate (ft/min). Default is 0.
+            mass: Aircraft mass (kg).
+            tas: Aircraft true airspeed (kt).
+            alt: Aircraft altitude (ft).
+            vs: Vertical rate (ft/min). Defaults to 0.
+            dT: Temperature deviation (K). Defaults to 0.
 
         Returns:
-            float: Fuel flow (kg/s).
+            Fuel flow (kg/s).
 
         """
         h = alt * self.aero.ft
         v = tas * self.aero.kts
+        dT = kwargs.get("dT", 0)
 
-        mach = self.aero.tas2mach(v, h)
-        delta = self.aero.pressure(h) / self.aero.p0
-        theta = self.aero.temperature(h) / self.aero.T0
-        gamma = self.sci.arctan2(vs * self.aero.fpm, v)
+        mach = self.aero.tas2mach(v, h, dT=dT)
+        delta = self.aero.pressure(h, dT=dT) / self.aero.p0
+        theta = self.aero.temperature(h, dT=dT) / self.aero.T0
+        gamma = self.backend.arctan2(vs * self.aero.fpm, v)
 
-        D = self.drag.clean(mass, tas, alt, vs)
-        T = D + mass * self.aero.g0 * self.sci.sin(gamma)
+        D = self.drag.clean(mass, tas, alt, vs, dT=dT)
+        T = D + mass * self.aero.g0 * self.backend.sin(gamma)
 
-        cT = T / (delta.reshape(-1, 1) * self.mass_ref * self.aero.g0)
+        cT = T / (delta * self.mass_ref * self.aero.g0)
 
-        f_matrix = self.sci.reshape(self.f_, (5, 5))
-        cT_powers = self.sci.array([cT[:, 0] ** i for i in range(5)]).reshape(5, -1)
-        M_powers = self.sci.array([mach[:, 0] ** i for i in range(5)]).reshape(5, -1)
-
-        cF_gen = self.sci.einsum("ij,jk,ik->k", f_matrix, cT_powers, M_powers)
+        cT_terms = [cT**i for i in range(5)]
+        mach_terms = [mach**i for i in range(5)]
+        cF_gen = _poly2(self.f_, (5, 5), mach_terms, cT_terms)
 
         fuel_flow_non_idle = self._calc_fuel(mass, delta, theta, cF_gen)
-        fuel_flow_idle = self.idle(mass, tas, alt)
+        fuel_flow_idle = self.idle(mass, tas, alt, dT=dT)
 
-        fuel_flow = self.sci.where(vs < -250, fuel_flow_idle, fuel_flow_non_idle)
+        fuel_flow = self.backend.where(vs < -250, fuel_flow_idle, fuel_flow_non_idle)
 
         return fuel_flow
